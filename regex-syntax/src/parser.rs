@@ -561,14 +561,11 @@ impl Parser {
 
     // Parses a character class as a `CharClass`, e.g., `[^a-zA-Z0-9]+`.
     //
-    // TODO: This does not convert to a `ByteClass` yet, so that it can be used for
-    // nested character classes.
-    //
     // Start: `[`
     // End:   `+`
     fn parse_class_as_chars(&mut self) -> Result<CharClass> {
-        let mut foo = vec![];
-        foo.extend(self.open_bracket());
+        let mut bracket_stack = vec![];
+        bracket_stack.extend(self.open_bracket());
         loop {
             if self.eof() {
                 // e.g., [a
@@ -578,36 +575,32 @@ impl Parser {
                 '[' => {
                     if let Some(class) = self.maybe_parse_ascii() {
                         // e.g. `[:alnum:]`
-                        foo.push(Stuff::Set(class));
+                        bracket_stack.push(Stuff::Set(class));
                     } else {
-                        foo.extend(self.open_bracket());
-                        // Nested set, e.g. `[c-d]` in `[a-b[c-d]]`
-//                        self.bump();
-//                        let negated = self.bump_if('^');
-                        // TODO: Check for - and ] at the start
-//                        foo.push(Stuff::LeftBracket {negated: negated});
+                        // nested set, e.g. `[c-d]` in `[a-b[c-d]]`
+                        bracket_stack.extend(self.open_bracket());
                     }
                 }
                 ']' => {
                     self.bump();
-                    let class = try!(self.close_bracket(&mut foo));
-                    if foo.is_empty() {
-                        // That was the outermost char class, that's it
+                    let class = try!(self.close_bracket(&mut bracket_stack));
+                    if bracket_stack.is_empty() {
+                        // That was the outermost class, so stop now
                         return Ok(class);
                     }
-                    foo.push(Stuff::Set(class));
+                    bracket_stack.push(Stuff::Set(class));
                 }
                 '\\' => {
                     let mut class = CharClass::empty();
                     // TODO: Make this just return a CharClass directly
                     try!(self.parse_class_escape(&mut class));
 
-                    foo.push(Stuff::Set(class));
+                    bracket_stack.push(Stuff::Set(class));
                 }
                 '&' if self.peek_is("&&") => {
                     self.bump();
                     self.bump();
-                    foo.push(Stuff::Intersection);
+                    bracket_stack.push(Stuff::Intersection);
                 }
                 start => {
                     if !self.flags.unicode {
@@ -628,7 +621,7 @@ impl Parser {
                     // TODO: Make it return CharClass directly
                     try!(self.parse_class_range(&mut class, start));
 
-                    foo.push(Stuff::Set(class));
+                    bracket_stack.push(Stuff::Set(class));
                 }
             }
         }
@@ -716,7 +709,8 @@ impl Parser {
     //
     // Start: `\`
     // End:   `x`
-    fn parse_class_escape(&mut self, class: &mut CharClass) -> Result<()> {
+    fn parse_class_escape(&mut self) -> Result<CharClass> {
+        let mut class = CharClass::empty();
         match try!(self.parse_escape()) {
             Build::Expr(Expr::Class(class2)) => {
                 class.ranges.extend(class2);
@@ -742,7 +736,7 @@ impl Parser {
             // Because `parse_escape` can never return `LeftParen`.
             _ => unreachable!(),
         }
-        Ok(())
+        Ok(class)
     }
 
     // Parses a single range in a character class.
@@ -757,6 +751,7 @@ impl Parser {
     // End:   `]`
     fn parse_class_range(&mut self, class: &mut CharClass, start: char)
                         -> Result<()> {
+        // TODO: Return CharClass instead
         if !self.bump_if('-') {
             // Not a range, so just push a singleton range.
             class.ranges.push(ClassRange::one(start));
@@ -2441,11 +2436,23 @@ mod tests {
 
     #[test]
     fn class_nested_class_brackets_hyphen() {
-        // This is really confusing, but `]` is allowed if first character within a class
+        // This is confusing, but `]` is allowed if first character within a class
         // It parses as a nested class with the `]` and `-` characters
         assert_eq!(p(r"[[]-]]"), Expr::Class(class(&[('-', '-'), (']', ']')])));
         assert_eq!(p(r"[[\[]]"), Expr::Class(class(&[('[', '[')])));
         assert_eq!(p(r"[[\]]]"), Expr::Class(class(&[(']', ']')])));
+    }
+
+    #[test]
+    fn class_nested_class_deep_nesting() {
+        // Makes sure that implementation can handle deep nesting.
+        // With recursive parsing, this regex would blow the stack size.
+        use std::iter::repeat;
+        let nesting = 10_000;
+        let open: String = repeat("[").take(nesting).collect();
+        let close: String = repeat("]").take(nesting).collect();
+        let s  = format!("{}a{}", open, close);
+        assert_eq!(p(&s), Expr::Class(class(&[('a', 'a')])));
     }
 
     #[test]
