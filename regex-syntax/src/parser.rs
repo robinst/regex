@@ -86,6 +86,14 @@ enum Build {
     },
 }
 
+enum Stuff {
+    LeftBracket {
+        negated: bool,
+    },
+    Set(CharClass),
+    Intersection,
+}
+
 // Primary expression parsing routines.
 impl Parser {
     pub fn parse(s: &str, flags: Flags) -> Result<Expr> {
@@ -553,97 +561,54 @@ impl Parser {
 
     // Parses a character class as a `CharClass`, e.g., `[^a-zA-Z0-9]+`.
     //
-    // This does not convert to a `ByteClass` yet, so that it can be used for
+    // TODO: This does not convert to a `ByteClass` yet, so that it can be used for
     // nested character classes.
     //
     // Start: `[`
     // End:   `+`
     fn parse_class_as_chars(&mut self) -> Result<CharClass> {
-        self.bump();
-        let negated = self.bump_if('^');
-
-        let mut class = try!(self.parse_class_set(true));
-        loop {
-            match self.cur() {
-                ']' => {
-                    // end of the class
-                    self.bump();
-                    break;
-                }
-                '&' => {
-                    // intersection with `&&`
-                    self.bump();
-                    self.bump();
-                    // parse next set and calculate intersection (left to right order)
-                    let class2 = try!(self.parse_class_set(false));
-                    // intersection returns canonicalized `CharClass`
-                    class = class.intersection(&class2);
-                }
-                _ => unreachable!()
-            }
-        }
-
-        // negate after combining all sets (`^` has lower precedence than `&&`)
-        if negated {
-            class = class.negate();
-        }
-        if class.is_empty() {
-            // e.g., [^\d\D]
-            return Err(self.err(ErrorKind::EmptyClass));
-        }
-        Ok(class)
-    }
-
-    // Parses a set in a character class. A set is the union of multiple
-    // consecutive single characters, ranges or nested sets.
-    //
-    // Terminates either when encountering a closing `]` or a `&&`.
-    //
-    // The returned `CharClass` is canonical.
-    //
-    // e.g., `[a-cd&&x-z]`
-    //
-    // Start: `a` (with first_set == true)
-    // End:   `&` (the first one)
-    //
-    // or
-    //
-    // Start: `x` (with first_set == false)
-    // End:   `]`
-    fn parse_class_set(&mut self, first_set: bool) -> Result<CharClass> {
-        let mut class = CharClass::empty();
-        // `-` at the start of the first set in a class is allowed.
-        // If it occurs after a `&&`, we need to check for the `--` operator.
-        if first_set {
-            while self.bump_if('-') {
-                class.ranges.push(ClassRange::one('-'));
-            }
-        }
+        let mut foo = vec![];
+        foo.extend(self.open_bracket());
         loop {
             if self.eof() {
                 // e.g., [a
                 return Err(self.err(ErrorKind::UnexpectedClassEof));
             }
             match self.cur() {
-                // If we're at the start of the class and `]` is the first
-                // character (sans, perhaps, the `^` symbol), it should
-                // be interpreted as a `]` instead of a closing class bracket.
-                // If we're after `&&` or there were other characters already,
-                // it should be interpreted as the end of the class.
-                ']' if !(first_set && class.len() == 0) => { break }
-                // `&&` means intersection with the next set, so stop parsing.
-                '&' if self.peek_is("&&") => { break }
-                '[' => match self.maybe_parse_ascii() {
-                    Some(class2) => class.ranges.extend(class2),
-                    None => {
+                '[' => {
+                    if let Some(class) = self.maybe_parse_ascii() {
+                        // e.g. `[:alnum:]`
+                        foo.push(Stuff::Set(class));
+                    } else {
+                        foo.extend(self.open_bracket());
                         // Nested set, e.g. `[c-d]` in `[a-b[c-d]]`
-                        let class2 = try!(self.parse_class_as_chars());
-                        class.ranges.extend(class2);
+//                        self.bump();
+//                        let negated = self.bump_if('^');
+                        // TODO: Check for - and ] at the start
+//                        foo.push(Stuff::LeftBracket {negated: negated});
                     }
-                },
+                }
+                ']' => {
+                    self.bump();
+                    let class = try!(self.close_bracket(&mut foo));
+                    if foo.is_empty() {
+                        // That was the outermost char class, that's it
+                        return Ok(class);
+                    }
+                    foo.push(Stuff::Set(class));
+                }
                 '\\' => {
+                    let mut class = CharClass::empty();
+                    // TODO: Make this just return a CharClass directly
                     try!(self.parse_class_escape(&mut class));
-                },
+
+                    foo.push(Stuff::Set(class));
+                }
+                '&' if self.peek_is("&&") => {
+                    self.bump();
+                    self.bump();
+                    foo.push(Stuff::Intersection);
+                }
                 start => {
                     if !self.flags.unicode {
                         let _ = try!(self.codepoint_to_one_byte(start));
@@ -659,16 +624,87 @@ impl Parser {
                         }
                         _ => {}
                     }
+                    let mut class = CharClass::empty();
+                    // TODO: Make it return CharClass directly
                     try!(self.parse_class_range(&mut class, start));
+
+                    foo.push(Stuff::Set(class));
                 }
             }
         }
-        Ok(if self.flags.casei {
+    }
+
+    fn open_bracket(&mut self) -> Vec<Stuff> {
+        self.bump();
+        let negated = self.bump_if('^');
+
+        let mut class = CharClass::empty();
+        while self.bump_if('-') {
+            class.ranges.push(ClassRange::one('-'));
+        }
+        if class.is_empty() {
+            if self.bump_if(']') {
+                class.ranges.push(ClassRange::one(']'));
+            }
+        }
+
+        let bracket = Stuff::LeftBracket { negated: negated };
+        if class.is_empty() {
+            vec![bracket]
+        } else {
+            vec![bracket, Stuff::Set(class)]
+        }
+    }
+
+    fn close_bracket(&self, stack: &mut Vec<Stuff>) -> Result<CharClass> {
+        let mut union = CharClass::empty();
+        let mut intersect = vec![];
+//        let mut intersect = None;
+        loop {
+            match stack.pop() {
+                Some(Stuff::Set(class)) => {
+                    union.ranges.extend(class);
+                },
+                Some(Stuff::LeftBracket { negated }) => {
+                    let mut class = self.class_union_transform(union);
+                    for c in intersect {
+                        class = class.intersection(&c);
+                    }
+                    // negate after combining all sets (`^` has lower precedence than `&&`)
+                    if negated {
+                        class = class.negate();
+                    }
+                    if class.is_empty() {
+                        // e.g., [^\d\D]
+                        return Err(self.err(ErrorKind::EmptyClass));
+                    }
+                    return Ok(class);
+                },
+                Some(Stuff::Intersection) => {
+                    let class = self.class_union_transform(union);
+                    intersect.push(class);
+                    union = CharClass::empty();
+
+//                    union = CharClass::empty();
+                    // TODO: intersect previous
+//                    intersect = Some(union);
+//                    union = CharClass::empty();
+                },
+                None => {
+                    // TOOD: ...
+                    unreachable!();
+                }
+            }
+        }
+    }
+
+    fn class_union_transform(&self, class: CharClass) -> CharClass {
+        if self.flags.casei {
             // Case folding canonicalizes too
             class.case_fold()
         } else {
             class.canonicalize()
-        })
+        }
     }
 
     // Parses an escape in a character class.
@@ -731,6 +767,7 @@ impl Parser {
             return Err(self.err(ErrorKind::UnexpectedClassEof));
         }
         if self.peek_is(']') {
+            // TODO: is this still valid?
             // This is the end of the class, so we permit use of `-` as a
             // regular char (just like we do in the beginning).
             class.ranges.push(ClassRange::one(start));
